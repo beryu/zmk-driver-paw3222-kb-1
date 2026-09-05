@@ -25,6 +25,7 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/pm/device.h>
 #include <zephyr/pm/device_runtime.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/util.h>
 
 #if defined(CONFIG_SOC_SERIES_NRF52X)
@@ -91,6 +92,7 @@ struct paw32xx_data {
     struct k_work motion_work;
     struct gpio_callback motion_cb;
     struct k_timer motion_timer; // Add timer for delayed motion checking
+    atomic_t suspended;
 #if defined(CONFIG_SOC_SERIES_NRF52X)
     NRF_SPIM_Type *spim;
     uint32_t spim_mosi_psel;
@@ -271,7 +273,7 @@ static int paw32xx_force_cs(const struct device *dev, bool force_low) {
 
     if (cs == NULL || cs->port == NULL || !device_is_ready(cs->port)) {
         LOG_ERR("CS GPIO not defined or not ready");
-        return ENODEV;
+        return -ENODEV;
     }
 
     ret = gpio_pin_set_dt(cs, force_low ? 1 : 0);
@@ -433,7 +435,26 @@ static int paw32xx_interrupt_disable(const struct device *dev) {
 
 static void paw32xx_motion_timer_handler(struct k_timer *timer) {
     struct paw32xx_data *data = CONTAINER_OF(timer, struct paw32xx_data, motion_timer);
+
+    if (atomic_get(&data->suspended)) {
+        return;
+    }
+
     k_work_submit(&data->motion_work);
+}
+
+static void paw32xx_reenable_motion_interrupt(const struct device *dev) {
+    struct paw32xx_data *data = dev->data;
+    int ret;
+
+    if (atomic_get(&data->suspended)) {
+        return;
+    }
+
+    ret = paw32xx_interrupt_enable(dev);
+    if (ret < 0) {
+        LOG_ERR("Failed to re-enable motion interrupt: %d", ret);
+    }
 }
 
 static void paw32xx_motion_work_handler(struct k_work *work) {
@@ -444,22 +465,34 @@ static void paw32xx_motion_work_handler(struct k_work *work) {
     int16_t x, y;
     int ret;
 
+    if (atomic_get(&data->suspended)) {
+        return;
+    }
+
     ret = paw32xx_read_reg(dev, PAW32XX_MOTION, &val);
     if (ret < 0) {
+        LOG_WRN("Failed to read motion register: %d", ret);
+        paw32xx_reenable_motion_interrupt(dev);
         return;
     }
 
     if ((val & MOTION_STATUS_MOTION) == 0x00) {
         // No motion detected, re-enable interrupts and wait for next interrupt
-        paw32xx_interrupt_enable(dev);
+        paw32xx_reenable_motion_interrupt(dev);
 
-        if (gpio_pin_get_dt(&cfg->irq_gpio) == 0) {
+        ret = gpio_pin_get_dt(&cfg->irq_gpio);
+        if (ret <= 0) {
+            if (ret < 0) {
+                LOG_WRN("Failed to read motion GPIO: %d", ret);
+            }
             return;
         }
     }
 
     ret = paw32xx_read_xy(dev, &x, &y);
     if (ret < 0) {
+        LOG_WRN("Failed to read motion delta: %d", ret);
+        paw32xx_reenable_motion_interrupt(dev);
         return;
     }
 
@@ -528,7 +561,9 @@ static void paw32xx_motion_work_handler(struct k_work *work) {
 #endif
 
     // Schedule next check after 15ms without using interrupts
-    k_timer_start(&data->motion_timer, K_MSEC(15), K_NO_WAIT);
+    if (!atomic_get(&data->suspended)) {
+        k_timer_start(&data->motion_timer, K_MSEC(15), K_NO_WAIT);
+    }
 }
 
 static void paw32xx_motion_handler(const struct device *gpio_dev, struct gpio_callback *cb,
@@ -538,6 +573,10 @@ static void paw32xx_motion_handler(const struct device *gpio_dev, struct gpio_ca
 
     ARG_UNUSED(gpio_dev);
     ARG_UNUSED(pins);
+
+    if (atomic_get(&data->suspended)) {
+        return;
+    }
 
     // Disable interrupts while timer is active
     paw32xx_interrupt_disable(dev);
@@ -660,10 +699,16 @@ static int paw32xx_configure(const struct device *dev) {
     k_sleep(K_MSEC(RESET_DELAY_MS));
 
     if (cfg->res_cpi > 0) {
-        paw32xx_set_resolution(dev, cfg->res_cpi);
+        ret = paw32xx_set_resolution(dev, cfg->res_cpi);
+        if (ret < 0) {
+            return ret;
+        }
     }
 
-    paw32xx_force_awake(dev, cfg->force_awake);
+    ret = paw32xx_force_awake(dev, cfg->force_awake);
+    if (ret < 0) {
+        return ret;
+    }
 
     // Dummy reads to clear any residual data
     paw32xx_read_reg(dev, PAW32XX_MOTION, &val);
@@ -696,6 +741,7 @@ static int paw32xx_init(const struct device *dev) {
     paw32xx_sdio_disconnect(data);
 
     data->dev = dev;
+    atomic_clear(&data->suspended);
 
     k_work_init(&data->motion_work, paw32xx_motion_work_handler);
     // Initialize the timer for delayed motion checks
@@ -782,28 +828,43 @@ static int paw32xx_init(const struct device *dev) {
 #ifdef CONFIG_PM_DEVICE
 static int paw32xx_pm_action(const struct device *dev, enum pm_device_action action) {
     const struct paw32xx_config *cfg = dev->config;
+    struct paw32xx_data *data = dev->data;
+    struct k_work_sync sync;
     int ret;
     uint8_t val;
 
     switch (action) {
     case PM_DEVICE_ACTION_SUSPEND:
+        atomic_set(&data->suspended, 1);
+
         // Disable IRQ interrupt
         ret = paw32xx_interrupt_disable(dev);
         if (ret < 0) {
             LOG_ERR("Failed to disable IRQ interrupt: %d", ret);
+            atomic_clear(&data->suspended);
             return ret;
         }
+
+        // Drain motion processing before changing SPI and sensor power state.
+        k_timer_stop(&data->motion_timer);
+        k_work_cancel_sync(&data->motion_work, &sync);
+        k_timer_stop(&data->motion_timer);
 
         // Disconnect IRQ GPIO
         ret = gpio_pin_configure_dt(&cfg->irq_gpio, GPIO_DISCONNECTED);
         if (ret < 0) {
             LOG_ERR("Failed to disconnect IRQ GPIO: %d", ret);
+            atomic_clear(&data->suspended);
+            paw32xx_reenable_motion_interrupt(dev);
             return ret;
         }
 
         val = CONFIGURATION_PD_ENH;
         ret = paw32xx_update_reg(dev, PAW32XX_CONFIGURATION, CONFIGURATION_PD_ENH, val);
         if (ret < 0) {
+            gpio_pin_configure_dt(&cfg->irq_gpio, GPIO_INPUT);
+            atomic_clear(&data->suspended);
+            paw32xx_reenable_motion_interrupt(dev);
             return ret;
         }
 
@@ -811,7 +872,6 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
         // Power off the device
         gpio_pin_configure_dt(&cfg->spi.config.cs.gpio, GPIO_INPUT | GPIO_PULL_DOWN);
 #if defined(CONFIG_SOC_SERIES_NRF52X)
-        struct paw32xx_data *data = dev->data;
         if (data->spim != NULL) {
             if (data->spim_miso_psel_saved) {
                 nrf_gpio_cfg_input(paw32xx_nrf52_psel_to_pin(data->spim_miso_psel),
@@ -832,12 +892,37 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
     case PM_DEVICE_ACTION_RESUME:
 
 #if DT_INST_NODE_HAS_PROP(0, power_gpios)
-        gpio_pin_configure_dt(&cfg->power_gpio, GPIO_OUTPUT_INACTIVE);
+        ret = gpio_pin_configure_dt(&cfg->spi.config.cs.gpio, GPIO_OUTPUT_INACTIVE);
+        if (ret < 0) {
+            LOG_ERR("Failed to restore CS GPIO: %d", ret);
+            return ret;
+        }
+
+#if defined(CONFIG_SOC_SERIES_NRF52X)
+        if (data->spim != NULL &&
+            (data->spim_sclk_psel & PAW32XX_NRF_PSEL_CONNECT_BIT) == 0U) {
+            nrf_gpio_cfg_output(paw32xx_nrf52_psel_to_pin(data->spim_sclk_psel));
+        }
+#endif
+
+        ret = gpio_pin_configure_dt(&cfg->power_gpio, GPIO_OUTPUT_INACTIVE);
+        if (ret < 0) {
+            LOG_ERR("Failed to restore power GPIO: %d", ret);
+            return ret;
+        }
         k_sleep(K_MSEC(10));
-        gpio_pin_set_dt(&cfg->power_gpio, 1);
+        ret = gpio_pin_set_dt(&cfg->power_gpio, 1);
+        if (ret < 0) {
+            LOG_ERR("Failed to enable sensor power: %d", ret);
+            return ret;
+        }
         k_sleep(K_MSEC(500));
 
-        paw32xx_configure(dev);
+        ret = paw32xx_configure(dev);
+        if (ret < 0) {
+            LOG_ERR("Failed to configure device after resume: %d", ret);
+            return ret;
+        }
 #endif
 
         val = 0;
@@ -853,10 +938,15 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
             return ret;
         }
 
+        // Clear the guard before enabling the level interrupt so an immediate
+        // callback can submit motion work.
+        atomic_clear(&data->suspended);
+
         // Re-enable IRQ interrupt
         ret = paw32xx_interrupt_enable(dev);
         if (ret < 0) {
             LOG_ERR("Failed to enable IRQ interrupt: %d", ret);
+            atomic_set(&data->suspended, 1);
             return ret;
         }
         break;
