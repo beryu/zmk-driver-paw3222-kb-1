@@ -1,188 +1,58 @@
-# ZMK PAW3222 Driver
+# ZMK PAW3222 driver for kb-1
 
-This driver enables the use of the PIXART PAW3222 optical sensor with the ZMK framework.
+[kb-1](https://github.com/beryu/kb-1)で使用するPAW3222トラックボール用のZMKドライバです。
+Seeed Studio XIAO nRF52840 Plusの`spi2`と、PAW3222の3線式SPI（MOSI/MISO共通）に対応しています。
 
-## Overview
+このリポジトリはkb-1専用です。torabo-tsuki-lpでは
+[`beryu/zmk-driver-paw3222`](https://github.com/beryu/zmk-driver-paw3222)を使用してください。
 
-The PAW3222 is a low-power optical mouse sensor suitable for tracking applications such as mice and trackballs. This driver communicates with the PAW3222 sensor via SPI interface.
+## 対応構成
 
-## Installation
+- SoC: Nordic nRF52840
+- SPIコントローラー: `spi0`〜`spi3`（kb-1は`spi2`）
+- 通信方式: PAW3222 3線式SPI
+- モーション検出: Active Low割り込み
+- センサー電源制御とZephyr Device PM
+- ZMKレイヤー連動スマートスクロール
 
-1. Add as a ZMK module in your west.yml:
+## kb-1での使用
 
-```
-manifest:
-  remotes:
-    - name: zmkfirmware
-      url-base: https://github.com/zmkfirmware
-    - name: sekigon-gonnoc
-      url-base: https://github.com/sekigon-gonnoc
-  projects:
-    - name: zmk
-      remote: zmkfirmware
-      revision: main
-      import: app/west.yml
-    - name: zmk-driver-paw3222
-      remote: sekigon-gonnoc
-      revision: main
+ファームウェア側の`config/west.yml`から、検証済みコミットをSHAで指定します。
+
+```yaml
+- name: zmk-driver-paw3222
+  url: https://github.com/beryu/zmk-driver-paw3222-kb-1
+  revision: <commit-sha>
 ```
 
-## Device Tree Configuration
+kb-1でのピン割り当ては次のとおりです。
 
-Configure in your shield or board config file (.overlay or .dtsi):
+| 信号 | XIAO | nRF52840 GPIO |
+| --- | --- | --- |
+| センサー電源 | D6 | P1.11 |
+| CS | D7 | P1.12 |
+| SCLK | D8 | P1.13 |
+| MOTION | D9 | P1.14 |
+| SDIO | D10 | P1.15 |
 
-```dts
-&pinctrl {
-    spi0_default: spi0_default {
-        group1 {
-            psels = <NRF_PSEL(SPIM_SCK, 0, 12)>,
-                <NRF_PSEL(SPIM_MOSI, 1, 9)>,
-                <NRF_PSEL(SPIM_MISO, 1, 9)>;
-        };
-    };
+実際のdevicetree設定とビルド構成は
+[`beryu/zmk-keyboard-kb-1`](https://github.com/beryu/zmk-keyboard-kb-1)を参照してください。
 
-    spi0_sleep: spi0_sleep {
-        group1 {
-            psels = <NRF_PSEL(SPIM_SCK, 0, 12)>,
-                <NRF_PSEL(SPIM_MOSI, 1, 9)>,
-                <NRF_PSEL(SPIM_MISO, 1, 9)>;
-            low-power-enable;
-        };
-    };
-};
+## Devicetreeプロパティ
 
-&spi0 {
-    status = "okay";
-    compatible = "nordic,nrf-spim";
-    pinctrl-0 = <&spi0_default>;
-    pinctrl-1 = <&spi0_sleep>;
-    pinctrl-names = "default", "sleep";
-    cs-gpios = <&gpio0 13 GPIO_ACTIVE_LOW>;
+- `irq-gpios`: MOTION端子（必須、Active Low）
+- `power-gpios`: センサー電源制御端子（任意）
+- `res-cpi`: CPI解像度（任意）
+- `force-awake`: センサーの省電力モードを無効化（任意）
 
-    trackball: trackball@0 {
-        status = "okay";
-        compatible = "pixart,paw3222";
-        reg = <0>;
-        spi-max-frequency = <2000000>;
-        irq-gpios = <&gpio0 15 GPIO_ACTIVE_LOW>;
-    };
-};
-```
+## 検証
 
-## Enable the module in your keyboard's Kconfig file
+ドライバ変更時は、ファームウェアリポジトリで以下の5構成をビルドして確認します。
 
-Add the following to your keyboard's `Kconfig.defconfig`:
+- 左Central（トラックボールあり）
+- 右Central（トラックボールあり）
+- 左Peripheral
+- 右Peripheral
+- Settings Reset
 
-```kconfig
-if ZMK_KEYBOARD_YOUR_KEYBOARD
-
-config ZMK_POINTING
-    default y
-
-config PAW3222
-    default y
-
-endif
-```
-
-## Properties
-
-- `irq-gpios`: GPIO connected to the motion pin (required)
-- `res-cpi`: CPI resolution for the sensor (optional)
-- `force-awake`: Initialize the sensor in "force awake" mode (optional, boolean)
-
----
-
-# ZMK PAW3222 ドライバ
-
-このドライバは、PIXART PAW3222光学センサーをZMKフレームワークで使用できるようにします。
-
-## 概要
-
-PAW3222は、マウスやトラックボールなどのトラッキングアプリケーションに適した低消費電力の光学マウスセンサーです。このドライバはSPIインターフェースを介してPAW3222センサーと通信します。
-
-## インストール
-
-1. ZMKモジュールとして追加：
-
-```
-# west.yml に追加
-manifest:
-  remotes:
-    - name: zmkfirmware
-      url-base: https://github.com/zmkfirmware
-    - name: sekigon-gonnoc
-      url-base: https://github.com/sekigon-gonnoc
-  projects:
-    - name: zmk
-      remote: zmkfirmware
-      revision: main
-      import: app/west.yml
-    - name: zmk-driver-paw3222
-      remote: sekigon-gonnoc
-      revision: main
-```
-
-## デバイスツリー設定
-
-シールドまたはボード設定ファイル（.overlayまたは.dtsi）で設定：
-
-```dts
-&pinctrl {
-    spi0_default: spi0_default {
-        group1 {
-            psels = <NRF_PSEL(SPIM_SCK, 0, 12)>,
-                <NRF_PSEL(SPIM_MOSI, 1, 9)>,
-                <NRF_PSEL(SPIM_MISO, 1, 9)>;
-        };
-    };
-
-    spi0_sleep: spi0_sleep {
-        group1 {
-            psels = <NRF_PSEL(SPIM_SCK, 0, 12)>,
-                <NRF_PSEL(SPIM_MOSI, 1, 9)>,
-                <NRF_PSEL(SPIM_MISO, 1, 9)>;
-            low-power-enable;
-        };
-    };
-};
-
-&spi0 {
-    status = "okay";
-    compatible = "nordic,nrf-spim";
-    pinctrl-0 = <&spi0_default>;
-    pinctrl-1 = <&spi0_sleep>;
-    pinctrl-names = "default", "sleep";
-    cs-gpios = <&gpio0 13 GPIO_ACTIVE_LOW>;
-
-    trackball: trackball@0 {
-        status = "okay";
-        compatible = "pixart,paw3222";
-        reg = <0>;
-        spi-max-frequency = <2000000>;
-        irq-gpios = <&gpio0 15 GPIO_ACTIVE_LOW>;
-    };
-};
-```
-
-## キーボードのKconfigファイルでモジュールを有効化
-
-キーボードの `Kconfig.defconfig` に以下を追加：
-
-```kconfig
-if ZMK_KEYBOARD_YOUR_KEYBOARD
-
-config ZMK_POINTING
-    default y
-
-config PAW3222
-    default y
-
-endif
-```
-
-## プロパティ
-
-- `irq-gpios`: モーションピンに接続されたGPIO（必須）
-- `res-cpi`: センサーのCPI解像度（任意）
-- `force-awake`: センサーを「強制起動」モードで初期化（任意、ブール値）
+ビルド成功だけでは実機上のSPI通信、移動方向、スリープ復帰、消費電流は確認できません。
