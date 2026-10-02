@@ -433,6 +433,15 @@ static int paw32xx_update_reg(const struct device *dev, uint8_t addr, uint8_t ma
 }
 
 static int paw32xx_read_xy(const struct device *dev, int16_t *x, int16_t *y) {
+#if defined(CONFIG_SOC_SERIES_NRF52X)
+    uint8_t dx, dy;
+    int ret = paw32xx_read_reg(dev, PAW32XX_DELTA_X, &dx);
+    if (ret < 0) { return ret; }
+    ret = paw32xx_read_reg(dev, PAW32XX_DELTA_Y, &dy);
+    if (ret < 0) { return ret; }
+    *x = dx;
+    *y = dy;
+#else
     const struct paw32xx_config *cfg = dev->config;
     int ret;
 
@@ -471,6 +480,7 @@ static int paw32xx_read_xy(const struct device *dev, int16_t *x, int16_t *y) {
 
     *x = rx_data[1];
     *y = rx_data[3];
+#endif
 
     *x = _sign_extend(*x, PAW32XX_DATA_SIZE_BITS - 1);
     *y = _sign_extend(*y, PAW32XX_DATA_SIZE_BITS - 1);
