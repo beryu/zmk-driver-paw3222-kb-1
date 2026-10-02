@@ -294,7 +294,65 @@ static inline int32_t _sign_extend(uint32_t value, uint8_t index) {
     return (int32_t)(value << shift) >> shift;
 }
 
+#if defined(CONFIG_SOC_SERIES_NRF52X)
+/* Half-duplex SDIO: release the output before the sensor sends data.
+ * Uses pinctrl's configured pins, with the successful GPIO diagnostic timing. */
+static int paw32xx_gpio_transfer(const struct device *dev, uint8_t addr,
+                                uint8_t *value, bool write) {
+    const struct paw32xx_config *cfg = dev->config;
+    struct paw32xx_data *data = dev->data;
+    if (!data->spim_mosi_psel_saved || !data->spim_miso_psel_saved) {
+        return -EINVAL;
+    }
+    uint32_t sd = paw32xx_nrf52_psel_to_pin(data->spim_mosi_psel);
+    uint32_t clk = paw32xx_nrf52_psel_to_pin(data->spim_sclk_psel);
+    if (sd != paw32xx_nrf52_psel_to_pin(data->spim_miso_psel)) {
+        return -EINVAL;
+    }
+    paw32xx_nrf52_spim_deactivate(data);
+    paw32xx_sdio_disconnect(data);
+    data->spim->PSEL.SCK = data->spim_sclk_psel | PAW32XX_NRF_PSEL_CONNECT_BIT;
+    nrf_gpio_pin_set(clk);
+    nrf_gpio_cfg_output(clk);
+    int ret = gpio_pin_configure_dt(&cfg->spi.config.cs.gpio, GPIO_OUTPUT_INACTIVE);
+    if (ret < 0) { return ret; }
+    ret = paw32xx_force_cs(dev, true);
+    if (ret < 0) { return ret; }
+    k_busy_wait(20);
+    nrf_gpio_cfg_output(sd);
+    uint8_t command = write ? (addr | SPI_WRITE) : (addr & 0x7f);
+    for (int bit = 7; bit >= 0; bit--) {
+        nrf_gpio_pin_write(sd, (command >> bit) & 1);
+        k_busy_wait(10);
+        nrf_gpio_pin_clear(clk);
+        k_busy_wait(10);
+        nrf_gpio_pin_set(clk);
+        k_busy_wait(10);
+    }
+    if (!write) {
+        nrf_gpio_cfg_input(sd, NRF_GPIO_PIN_NOPULL);
+        *value = 0;
+        k_busy_wait(20);
+    }
+    for (int bit = 7; bit >= 0; bit--) {
+        if (write) { nrf_gpio_pin_write(sd, (*value >> bit) & 1); }
+        nrf_gpio_pin_clear(clk);
+        k_busy_wait(10);
+        nrf_gpio_pin_set(clk);
+        if (!write) { *value |= nrf_gpio_pin_read(sd) << bit; }
+        k_busy_wait(10);
+    }
+    ret = paw32xx_force_cs(dev, false);
+    nrf_gpio_cfg_input(sd, NRF_GPIO_PIN_NOPULL);
+    k_busy_wait(20);
+    return ret;
+}
+#endif
+
 static int paw32xx_read_reg(const struct device *dev, uint8_t addr, uint8_t *value) {
+#if defined(CONFIG_SOC_SERIES_NRF52X)
+    return paw32xx_gpio_transfer(dev, addr, value, false);
+#else
     const struct paw32xx_config *cfg = dev->config;
     int ret;
 
@@ -327,9 +385,13 @@ static int paw32xx_read_reg(const struct device *dev, uint8_t addr, uint8_t *val
     paw32xx_spi_transaction_end(dev);
 
     return ret;
+#endif
 }
 
 static int paw32xx_write_reg(const struct device *dev, uint8_t addr, uint8_t value) {
+#if defined(CONFIG_SOC_SERIES_NRF52X)
+    return paw32xx_gpio_transfer(dev, addr, &value, true);
+#else
     const struct paw32xx_config *cfg = dev->config;
     int ret;
 
@@ -348,6 +410,7 @@ static int paw32xx_write_reg(const struct device *dev, uint8_t addr, uint8_t val
     paw32xx_spi_transaction_end(dev);
 
     return ret;
+#endif
 }
 
 static int paw32xx_update_reg(const struct device *dev, uint8_t addr, uint8_t mask, uint8_t value) {
@@ -370,6 +433,15 @@ static int paw32xx_update_reg(const struct device *dev, uint8_t addr, uint8_t ma
 }
 
 static int paw32xx_read_xy(const struct device *dev, int16_t *x, int16_t *y) {
+#if defined(CONFIG_SOC_SERIES_NRF52X)
+    uint8_t dx, dy;
+    int ret = paw32xx_read_reg(dev, PAW32XX_DELTA_X, &dx);
+    if (ret < 0) { return ret; }
+    ret = paw32xx_read_reg(dev, PAW32XX_DELTA_Y, &dy);
+    if (ret < 0) { return ret; }
+    *x = dx;
+    *y = dy;
+#else
     const struct paw32xx_config *cfg = dev->config;
     int ret;
 
@@ -408,6 +480,7 @@ static int paw32xx_read_xy(const struct device *dev, int16_t *x, int16_t *y) {
 
     *x = rx_data[1];
     *y = rx_data[3];
+#endif
 
     *x = _sign_extend(*x, PAW32XX_DATA_SIZE_BITS - 1);
     *y = _sign_extend(*y, PAW32XX_DATA_SIZE_BITS - 1);
@@ -803,6 +876,20 @@ static int paw32xx_init(const struct device *dev) {
         LOG_ERR("Could not set motion callback: %d", ret);
         return ret;
     }
+
+#if defined(CONFIG_SOC_SERIES_NRF52X)
+    /* Reset clock/bus state before the first product-ID transaction. */
+    paw32xx_nrf52_spim_deactivate(data);
+    data->spim->PSEL.SCK = data->spim_sclk_psel | PAW32XX_NRF_PSEL_CONNECT_BIT;
+    uint32_t clk = paw32xx_nrf52_psel_to_pin(data->spim_sclk_psel);
+    ret = gpio_pin_configure_dt(&cfg->spi.config.cs.gpio, GPIO_OUTPUT_INACTIVE);
+    if (ret < 0) { return ret; }
+    nrf_gpio_pin_clear(clk);
+    nrf_gpio_cfg_output(clk);
+    k_busy_wait(1000);
+    nrf_gpio_pin_set(clk);
+    k_busy_wait(2000);
+#endif
 
     ret = paw32xx_configure(dev);
     if (ret != 0) {
