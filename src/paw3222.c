@@ -297,8 +297,9 @@ static inline int32_t _sign_extend(uint32_t value, uint8_t index) {
 #if defined(CONFIG_SOC_SERIES_NRF52X)
 /* Half-duplex SDIO: release the output before the sensor sends data.
  * Uses pinctrl's configured pins, with the successful GPIO diagnostic timing. */
-static int paw32xx_gpio_transfer(const struct device *dev, uint8_t addr,
-                                uint8_t *value, bool write) {
+static int paw32xx_gpio_transfer_part(const struct device *dev, uint8_t addr,
+                                     uint8_t *value, bool write,
+                                     bool begin, bool end) {
     const struct paw32xx_config *cfg = dev->config;
     struct paw32xx_data *data = dev->data;
     if (!data->spim_mosi_psel_saved || !data->spim_miso_psel_saved) {
@@ -314,11 +315,14 @@ static int paw32xx_gpio_transfer(const struct device *dev, uint8_t addr,
     data->spim->PSEL.SCK = data->spim_sclk_psel | PAW32XX_NRF_PSEL_CONNECT_BIT;
     nrf_gpio_pin_set(clk);
     nrf_gpio_cfg_output(clk);
-    int ret = gpio_pin_configure_dt(&cfg->spi.config.cs.gpio, GPIO_OUTPUT_INACTIVE);
-    if (ret < 0) { return ret; }
-    ret = paw32xx_force_cs(dev, true);
-    if (ret < 0) { return ret; }
-    k_busy_wait(20);
+    int ret = 0;
+    if (begin) {
+        ret = gpio_pin_configure_dt(&cfg->spi.config.cs.gpio, GPIO_OUTPUT_INACTIVE);
+        if (ret < 0) { return ret; }
+        ret = paw32xx_force_cs(dev, true);
+        if (ret < 0) { return ret; }
+        k_busy_wait(20);
+    }
     nrf_gpio_cfg_output(sd);
     uint8_t command = write ? (addr | SPI_WRITE) : (addr & 0x7f);
     for (int bit = 7; bit >= 0; bit--) {
@@ -345,10 +349,17 @@ static int paw32xx_gpio_transfer(const struct device *dev, uint8_t addr,
         }
         k_busy_wait(50);
     }
-    ret = paw32xx_force_cs(dev, false);
+    if (end) {
+        ret = paw32xx_force_cs(dev, false);
+    }
     nrf_gpio_cfg_input(sd, NRF_GPIO_PIN_NOPULL);
     k_busy_wait(20);
     return ret;
+}
+
+static int paw32xx_gpio_transfer(const struct device *dev, uint8_t addr,
+                                uint8_t *value, bool write) {
+    return paw32xx_gpio_transfer_part(dev, addr, value, write, true, true);
 }
 #endif
 
@@ -438,10 +449,18 @@ static int paw32xx_update_reg(const struct device *dev, uint8_t addr, uint8_t ma
 static int paw32xx_read_xy(const struct device *dev, int16_t *x, int16_t *y) {
 #if defined(CONFIG_SOC_SERIES_NRF52X)
     uint8_t dx, dy;
-    int ret = paw32xx_read_reg(dev, PAW32XX_DELTA_X, &dx);
-    if (ret < 0) { return ret; }
-    ret = paw32xx_read_reg(dev, PAW32XX_DELTA_Y, &dy);
-    if (ret < 0) { return ret; }
+    /* Match the reference SPI path: X command/data and Y command/data
+     * share one CS assertion. Keep half-duplex SDIO for each data byte. */
+    int ret = paw32xx_gpio_transfer_part(dev, PAW32XX_DELTA_X, &dx,
+                                       false, true, false);
+    if (ret == 0) {
+        ret = paw32xx_gpio_transfer_part(dev, PAW32XX_DELTA_Y, &dy,
+                                        false, false, true);
+    }
+    if (ret < 0) {
+        paw32xx_force_cs(dev, false);
+        return ret;
+    }
     *x = dx;
     *y = dy;
 #else
