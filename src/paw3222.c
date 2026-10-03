@@ -338,11 +338,12 @@ static int paw32xx_gpio_transfer(const struct device *dev, uint8_t addr,
         if (write) { nrf_gpio_pin_write(sd, (*value >> bit) & 1); }
         nrf_gpio_pin_clear(clk);
         k_busy_wait(50);
-        nrf_gpio_pin_set(clk);
         if (!write) {
-            k_busy_wait(50);
+            /* The sensor drives each bit after the falling clock edge.
+             * Sample while CLK is low, before the next rising edge. */
             *value |= nrf_gpio_pin_read(sd) << bit;
         }
+        nrf_gpio_pin_set(clk);
         k_busy_wait(50);
     }
     ret = paw32xx_force_cs(dev, false);
