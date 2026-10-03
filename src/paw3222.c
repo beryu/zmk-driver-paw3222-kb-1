@@ -93,6 +93,12 @@ struct paw32xx_data {
     struct gpio_callback motion_cb;
     struct k_timer motion_timer; // Add timer for delayed motion checking
     atomic_t suspended;
+    struct k_work_delayable report_work;
+    struct k_work_q report_queue;
+    K_KERNEL_STACK_MEMBER(report_stack, 2048);
+    struct k_spinlock report_lock;
+    int32_t pending_x, pending_y;
+    int64_t last_read_warning;
 #if defined(CONFIG_SOC_SERIES_NRF52X)
     NRF_SPIM_Type *spim;
     uint32_t spim_mosi_psel;
@@ -334,21 +340,30 @@ static int paw32xx_gpio_transfer(const struct device *dev, uint8_t addr,
         *value = 0;
         k_busy_wait(300);
     }
+    bool unstable = false;
     for (int bit = 7; bit >= 0; bit--) {
         if (write) { nrf_gpio_pin_write(sd, (*value >> bit) & 1); }
         nrf_gpio_pin_clear(clk);
         k_busy_wait(50);
         nrf_gpio_pin_set(clk);
         if (!write) {
-            k_busy_wait(50);
-            *value |= nrf_gpio_pin_read(sd) << bit;
+            /* Keep the established sampling phase, but reject a bit
+             * that changes within its sampling window. */
+            k_busy_wait(40);
+            uint32_t first = nrf_gpio_pin_read(sd);
+            k_busy_wait(5);
+            uint32_t middle = nrf_gpio_pin_read(sd);
+            k_busy_wait(5);
+            uint32_t last = nrf_gpio_pin_read(sd);
+            unstable |= (first != middle || middle != last);
+            *value |= last << bit;
         }
         k_busy_wait(50);
     }
     ret = paw32xx_force_cs(dev, false);
     nrf_gpio_cfg_input(sd, NRF_GPIO_PIN_NOPULL);
     k_busy_wait(20);
-    return ret;
+    return ret < 0 ? ret : (unstable ? -EIO : 0);
 }
 #endif
 
@@ -533,6 +548,46 @@ static void paw32xx_reenable_motion_interrupt(const struct device *dev) {
     }
 }
 
+/* One bounded accumulator, rather than one queued report per sample.
+ * The report worker may wait for ZMK input without blocking acquisition. */
+static void paw32xx_report_work_handler(struct k_work *work) {
+    struct paw32xx_data *data = CONTAINER_OF(k_work_delayable_from_work(work),
+                                            struct paw32xx_data, report_work);
+    if (atomic_get(&data->suspended)) { return; }
+    k_spinlock_key_t key = k_spin_lock(&data->report_lock);
+    int16_t x = data->pending_x, y = data->pending_y;
+    data->pending_x = data->pending_y = 0;
+    k_spin_unlock(&data->report_lock, key);
+    if (x != 0 || y != 0) {
+        input_report_rel(data->dev, INPUT_REL_X, x, false, K_FOREVER);
+        input_report_rel(data->dev, INPUT_REL_Y, y, true, K_FOREVER);
+    }
+    key = k_spin_lock(&data->report_lock);
+    bool pending = data->pending_x != 0 || data->pending_y != 0;
+    k_spin_unlock(&data->report_lock, key);
+    if (pending && !atomic_get(&data->suspended)) {
+        k_work_schedule_for_queue(&data->report_queue, &data->report_work,
+                                 K_MSEC(CONFIG_PAW3222_REPORT_INTERVAL_MS));
+    }
+}
+
+static void paw32xx_queue_motion(struct paw32xx_data *data, int16_t x, int16_t y) {
+    if ((x == 0 && y == 0) || atomic_get(&data->suspended)) { return; }
+    k_spinlock_key_t key = k_spin_lock(&data->report_lock);
+    data->pending_x = CLAMP(data->pending_x + x, INT16_MIN, INT16_MAX);
+    data->pending_y = CLAMP(data->pending_y + y, INT16_MIN, INT16_MAX);
+    k_spin_unlock(&data->report_lock, key);
+    /* schedule, not reschedule: incoming samples never push the deadline back. */
+    k_work_schedule_for_queue(&data->report_queue, &data->report_work,
+                             K_MSEC(CONFIG_PAW3222_REPORT_INTERVAL_MS));
+}
+
+static int paw32xx_check_link(const struct device *dev) {
+    uint8_t id;
+    int ret = paw32xx_read_reg(dev, PAW32XX_PRODUCT_ID1, &id);
+    return ret < 0 ? ret : (id == PRODUCT_ID_PAW32XX ? 0 : -EIO);
+}
+
 static void paw32xx_motion_work_handler(struct k_work *work) {
     struct paw32xx_data *data = CONTAINER_OF(work, struct paw32xx_data, motion_work);
     const struct device *dev = data->dev;
@@ -545,11 +600,11 @@ static void paw32xx_motion_work_handler(struct k_work *work) {
         return;
     }
 
+    ret = paw32xx_check_link(dev);
+    if (ret < 0) { goto invalid_sample; }
     ret = paw32xx_read_reg(dev, PAW32XX_MOTION, &val);
     if (ret < 0) {
-        LOG_WRN("Failed to read motion register: %d", ret);
-        paw32xx_reenable_motion_interrupt(dev);
-        return;
+        goto invalid_sample;
     }
 
     if ((val & MOTION_STATUS_MOTION) == 0x00) {
@@ -566,11 +621,9 @@ static void paw32xx_motion_work_handler(struct k_work *work) {
     }
 
     ret = paw32xx_read_xy(dev, &x, &y);
-    if (ret < 0) {
-        LOG_WRN("Failed to read motion delta: %d", ret);
-        paw32xx_reenable_motion_interrupt(dev);
-        return;
-    }
+    if (ret < 0) { goto invalid_sample; }
+    ret = paw32xx_check_link(dev);
+    if (ret < 0) { goto invalid_sample; }
 
     LOG_DBG("x=%4d y=%4d", x, y);
 
@@ -616,26 +669,25 @@ static void paw32xx_motion_work_handler(struct k_work *work) {
         data->remainder_x -= (float)out_x;
         data->remainder_y -= (float)out_y;
 
-        if (out_x != 0 || out_y != 0) {
-            /* 最後のイベントに sync=true を立てる */
-            bool x_is_last = (out_y == 0);
-            if (out_x != 0) {
-                input_report_rel(data->dev, INPUT_REL_X, out_x, x_is_last, K_FOREVER);
-            }
-            if (out_y != 0) {
-                input_report_rel(data->dev, INPUT_REL_Y, out_y, true, K_FOREVER);
-            }
-        }
+        paw32xx_queue_motion(data, out_x, out_y);
     } else {
         /* 通常レイヤー（ポインタ移動）：スケーリングなし、そのまま出力 */
-        input_report_rel(data->dev, INPUT_REL_X, x, false, K_FOREVER);
-        input_report_rel(data->dev, INPUT_REL_Y, y, true, K_FOREVER);
+        paw32xx_queue_motion(data, x, y);
     }
 #else
-    input_report_rel(data->dev, INPUT_REL_X, x, false, K_FOREVER);
-    input_report_rel(data->dev, INPUT_REL_Y, y, true, K_FOREVER);
+    paw32xx_queue_motion(data, x, y);
 #endif
 
+    goto next_check;
+
+invalid_sample:
+    /* A rejected delta cannot safely be reread: these registers may clear
+     * on read. Drop this pair and poll again instead of guessing a direction. */
+    if (k_uptime_get() - data->last_read_warning >= 1000) {
+        LOG_WRN("Rejected motion sample: unstable SDIO or invalid product ID (%d)", ret);
+        data->last_read_warning = k_uptime_get();
+    }
+next_check:
     // Schedule the next check after the configured delay.
     if (!atomic_get(&data->suspended)) {
         k_timer_start(&data->motion_timer, K_MSEC(CONFIG_PAW3222_MOTION_INTERVAL_MS), K_NO_WAIT);
@@ -819,6 +871,9 @@ static int paw32xx_init(const struct device *dev) {
     data->dev = dev;
     atomic_clear(&data->suspended);
 
+    k_work_queue_start(&data->report_queue, data->report_stack,
+                       K_KERNEL_STACK_SIZEOF(data->report_stack), 5, NULL);
+    k_work_init_delayable(&data->report_work, paw32xx_report_work_handler);
     k_work_init(&data->motion_work, paw32xx_motion_work_handler);
     // Initialize the timer for delayed motion checks
     k_timer_init(&data->motion_timer, paw32xx_motion_timer_handler, NULL);
@@ -939,6 +994,10 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
         k_timer_stop(&data->motion_timer);
         k_work_cancel_sync(&data->motion_work, &sync);
         k_timer_stop(&data->motion_timer);
+        k_work_cancel_delayable_sync(&data->report_work, &sync);
+        k_spinlock_key_t key = k_spin_lock(&data->report_lock);
+        data->pending_x = data->pending_y = 0;
+        k_spin_unlock(&data->report_lock, key);
 
         // Disconnect IRQ GPIO
         ret = gpio_pin_configure_dt(&cfg->irq_gpio, GPIO_DISCONNECTED);

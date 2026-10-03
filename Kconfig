@@ -53,3 +53,12 @@ config PAW3222_MOTION_INTERVAL_MS
     help
       Sensor transfer time is added to this delay. Shorter intervals improve
       motion reporting frequency at the cost of CPU time and power usage.
+
+config PAW3222_REPORT_INTERVAL_MS
+    int "Coalesced motion report interval, in milliseconds"
+    default 15
+    range 1 100
+    depends on PAW3222
+    help
+      Accumulate relative motion for this interval on a separate report worker.
+      Report backpressure does not stop sensor acquisition.
