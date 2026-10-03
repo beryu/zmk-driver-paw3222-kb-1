@@ -323,24 +323,27 @@ static int paw32xx_gpio_transfer(const struct device *dev, uint8_t addr,
     uint8_t command = write ? (addr | SPI_WRITE) : (addr & 0x7f);
     for (int bit = 7; bit >= 0; bit--) {
         nrf_gpio_pin_write(sd, (command >> bit) & 1);
-        k_busy_wait(10);
+        k_busy_wait(50);
         nrf_gpio_pin_clear(clk);
-        k_busy_wait(10);
+        k_busy_wait(50);
         nrf_gpio_pin_set(clk);
-        k_busy_wait(10);
+        k_busy_wait(50);
     }
     if (!write) {
         nrf_gpio_cfg_input(sd, NRF_GPIO_PIN_NOPULL);
         *value = 0;
-        k_busy_wait(20);
+        k_busy_wait(300);
     }
     for (int bit = 7; bit >= 0; bit--) {
         if (write) { nrf_gpio_pin_write(sd, (*value >> bit) & 1); }
         nrf_gpio_pin_clear(clk);
-        k_busy_wait(10);
+        k_busy_wait(50);
         nrf_gpio_pin_set(clk);
-        if (!write) { *value |= nrf_gpio_pin_read(sd) << bit; }
-        k_busy_wait(10);
+        if (!write) {
+            k_busy_wait(50);
+            *value |= nrf_gpio_pin_read(sd) << bit;
+        }
+        k_busy_wait(50);
     }
     ret = paw32xx_force_cs(dev, false);
     nrf_gpio_cfg_input(sd, NRF_GPIO_PIN_NOPULL);
