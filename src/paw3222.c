@@ -636,9 +636,9 @@ static void paw32xx_motion_work_handler(struct k_work *work) {
     input_report_rel(data->dev, INPUT_REL_Y, y, true, K_FOREVER);
 #endif
 
-    // Schedule next check after 15ms without using interrupts
+    // Schedule the next check after the configured delay.
     if (!atomic_get(&data->suspended)) {
-        k_timer_start(&data->motion_timer, K_MSEC(15), K_NO_WAIT);
+        k_timer_start(&data->motion_timer, K_MSEC(CONFIG_PAW3222_MOTION_INTERVAL_MS), K_NO_WAIT);
     }
 }
 

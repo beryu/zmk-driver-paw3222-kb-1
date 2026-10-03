@@ -44,3 +44,12 @@ config PAW3222_SCROLL_SENSITIVITY
     help
       Controls how aggressively the sigmoid curve boosts fast motion.
       Higher values make the acceleration effect stronger.
+
+config PAW3222_MOTION_INTERVAL_MS
+    int "Delay after reading motion, in milliseconds"
+    default 15
+    range 1 100
+    depends on PAW3222
+    help
+      Sensor transfer time is added to this delay. Shorter intervals improve
+      motion reporting frequency at the cost of CPU time and power usage.
