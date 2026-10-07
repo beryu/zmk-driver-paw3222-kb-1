@@ -73,6 +73,12 @@ LOG_MODULE_REGISTER(paw32xx, CONFIG_ZMK_LOG_LEVEL);
 
 #define PAW32XX_DATA_SIZE_BITS 8
 
+#define PAW32XX_GPIO_INIT_EDGE_DELAY_US 50
+#define PAW32XX_GPIO_INIT_TURNAROUND_US 300
+#define PAW32XX_GPIO_INIT_SAMPLE_DELAY_US 50
+#define PAW32XX_GPIO_RUNTIME_EDGE_DELAY_US 10
+#define PAW32XX_GPIO_RUNTIME_TURNAROUND_US 20
+
 #define RESET_DELAY_MS 2
 
 #define RES_STEP 38
@@ -89,6 +95,7 @@ struct paw32xx_config {
 
 struct paw32xx_data {
     const struct device *dev;
+    bool sensor_initialized;
     struct k_work motion_work;
     struct gpio_callback motion_cb;
     struct k_timer motion_timer; // Add timer for delayed motion checking
@@ -301,6 +308,12 @@ static int paw32xx_gpio_transfer(const struct device *dev, uint8_t addr,
                                 uint8_t *value, bool write) {
     const struct paw32xx_config *cfg = dev->config;
     struct paw32xx_data *data = dev->data;
+    uint32_t edge_delay_us = data->sensor_initialized
+                                 ? PAW32XX_GPIO_RUNTIME_EDGE_DELAY_US
+                                 : PAW32XX_GPIO_INIT_EDGE_DELAY_US;
+    uint32_t turnaround_delay_us = data->sensor_initialized
+                                       ? PAW32XX_GPIO_RUNTIME_TURNAROUND_US
+                                       : PAW32XX_GPIO_INIT_TURNAROUND_US;
     if (!data->spim_mosi_psel_saved || !data->spim_miso_psel_saved) {
         return -EINVAL;
     }
@@ -323,27 +336,29 @@ static int paw32xx_gpio_transfer(const struct device *dev, uint8_t addr,
     uint8_t command = write ? (addr | SPI_WRITE) : (addr & 0x7f);
     for (int bit = 7; bit >= 0; bit--) {
         nrf_gpio_pin_write(sd, (command >> bit) & 1);
-        k_busy_wait(50);
+        k_busy_wait(edge_delay_us);
         nrf_gpio_pin_clear(clk);
-        k_busy_wait(50);
+        k_busy_wait(edge_delay_us);
         nrf_gpio_pin_set(clk);
-        k_busy_wait(50);
+        k_busy_wait(edge_delay_us);
     }
     if (!write) {
         nrf_gpio_cfg_input(sd, NRF_GPIO_PIN_NOPULL);
         *value = 0;
-        k_busy_wait(300);
+        k_busy_wait(turnaround_delay_us);
     }
     for (int bit = 7; bit >= 0; bit--) {
         if (write) { nrf_gpio_pin_write(sd, (*value >> bit) & 1); }
         nrf_gpio_pin_clear(clk);
-        k_busy_wait(50);
+        k_busy_wait(edge_delay_us);
         nrf_gpio_pin_set(clk);
         if (!write) {
-            k_busy_wait(50);
+            if (!data->sensor_initialized) {
+                k_busy_wait(PAW32XX_GPIO_INIT_SAMPLE_DELAY_US);
+            }
             *value |= nrf_gpio_pin_read(sd) << bit;
         }
-        k_busy_wait(50);
+        k_busy_wait(edge_delay_us);
     }
     ret = paw32xx_force_cs(dev, false);
     nrf_gpio_cfg_input(sd, NRF_GPIO_PIN_NOPULL);
@@ -722,9 +737,12 @@ int paw32xx_force_awake(const struct device *dev, bool enable) {
 
 static int paw32xx_configure(const struct device *dev) {
     const struct paw32xx_config *cfg = dev->config;
+    struct paw32xx_data *data = dev->data;
     uint8_t val;
     int ret;
     int retry_count = 10;
+
+    data->sensor_initialized = false;
 
     // Check if the device is ready
     while (retry_count--) {
@@ -792,6 +810,7 @@ static int paw32xx_configure(const struct device *dev) {
     paw32xx_read_reg(dev, PAW32XX_DELTA_Y, &val);
     paw32xx_read_reg(dev, PAW32XX_DELTA_XY_HI, &val);
 
+    data->sensor_initialized = true;
     return 0;
 }
 
